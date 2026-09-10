@@ -1,6 +1,6 @@
 use std::{
     cell::Cell,
-    fmt::{Display, Formatter},
+    fmt::{Display, Formatter, Write as _},
     hash::{BuildHasher, Hash},
     ops::{Deref, DerefMut},
     sync::{
@@ -16,6 +16,8 @@ use tracing::span::Id;
 use turbo_bincode::TurboBincodeBuffer;
 use turbo_tasks::{FxDashMap, TaskId, backend::CachedTaskTypeArc, event::Event, parallel};
 
+#[cfg(debug_assertions)]
+use crate::backend::storage_schema::GcRootHolders;
 use crate::{
     backend::storage_schema::{
         DropPartialOutcome, KeyEvictability, TaskStorage, UnevictableReason, ValueEvictability,
@@ -579,19 +581,130 @@ impl Storage {
 
     /// Return the set of all known live roots.
     pub fn gc_scan_roots(&self) -> impl Iterator<Item = TaskId> {
+        // Roots that failed the "held by a transient pin" expectation, with the referencing tasks
+        // that kept them un-collectible. Collected during the scan and reported *after* it: naming
+        // a dependent means reading its storage, and the shard locks are held inside the closure.
+        #[cfg(debug_assertions)]
+        let unexpected = std::sync::Mutex::new(Vec::<(TaskId, GcRootHolders)>::new());
+        // Tasks this pass deleted that still have cell dependents. `gc_maybe_collectible` still
+        // counts cell dependents today, so this should find nothing; it is the standing check for
+        // the invariant that would make ignoring them sound — every dependent of a collected task
+        // must itself be collected in the same pass. Survivors are resolved after the scan.
+        #[cfg(debug_assertions)]
+        let deleted_with_dependents = std::sync::Mutex::new(Vec::<(TaskId, GcRootHolders)>::new());
+
         let per_shard: Vec<Vec<TaskId>> =
             parallel::map_collect(&(0..self.shard_count()).collect::<Vec<_>>(), |&index| {
                 let mut roots = Vec::new();
                 self.for_each_resident_persistent_in_shard(index, |task_id, storage| {
+                    // A task deleted by this pass is still resident until eviction, so the same
+                    // scan can check the cell-dependency invariant for free.
+                    #[cfg(debug_assertions)]
+                    if storage.flags.deleted() {
+                        let dependents = storage.gc_cell_dependents();
+                        if dependents.iter().next().is_some() {
+                            deleted_with_dependents
+                                .lock()
+                                .unwrap()
+                                .push((task_id, dependents));
+                        }
+                    }
                     if storage.gc_is_root() {
                         // The `is_root` criteria is conservative, in debug assert that we aren't m
-                        storage.gc_debug_assert_root_held_by_transient_pin();
+                        #[cfg(debug_assertions)]
+                        if !storage.gc_is_held_by_transient_pin() {
+                            unexpected
+                                .lock()
+                                .unwrap()
+                                .push((task_id, storage.gc_root_holders()));
+                        }
                         roots.push(task_id);
                     }
                 });
                 roots
             });
+
+        // Report only dependents that *survived*: a dependent deleted in the same pass is the
+        // expected cascade, not a violation.
+        #[cfg(debug_assertions)]
+        {
+            let violations: Vec<_> = deleted_with_dependents
+                .into_inner()
+                .unwrap()
+                .into_iter()
+                .filter_map(|(task_id, dependents)| {
+                    let survivors: Vec<_> = dependents
+                        .iter()
+                        .filter(|(_, dep)| !self.access_mut(*dep).flags.deleted())
+                        .copied()
+                        .collect();
+                    (!survivors.is_empty()).then_some((task_id, survivors))
+                })
+                .collect();
+            if !violations.is_empty() {
+                let mut report = String::new();
+                for (task_id, survivors) in &violations {
+                    let _ = writeln!(
+                        report,
+                        "  collected {} ({task_id:?}) is still depended on by:",
+                        self.describe_task(*task_id)
+                    );
+                    for (kind, dep) in survivors {
+                        let _ = writeln!(
+                            report,
+                            "    via {kind}: {} ({dep:?})",
+                            self.describe_task(*dep)
+                        );
+                    }
+                }
+                panic!(
+                    "{} collected task(s) left a stale cell dependency behind.\nGC ignores cell \
+                     dependencies because ancestry is expected to collect every dependent in the \
+                     same pass; a surviving dependent breaks that assumption.\n{report}",
+                    violations.len()
+                );
+            }
+        }
+
+        #[cfg(debug_assertions)]
+        {
+            let unexpected = unexpected.into_inner().unwrap();
+            if !unexpected.is_empty() {
+                let mut report = String::new();
+                for (task_id, holders) in &unexpected {
+                    let _ = writeln!(
+                        report,
+                        "  {} ({task_id:?}) is held by:",
+                        self.describe_task(*task_id)
+                    );
+                    for (kind, holder) in holders.iter() {
+                        let _ = writeln!(
+                            report,
+                            "    via {kind}: {} ({holder:?})",
+                            self.describe_task(*holder)
+                        );
+                    }
+                }
+                panic!(
+                    "{} GC root(s) held by a non-transient pin.\nBeing held by another kind of \
+                     reference implies a bug in GC or the aggregation graph.\n{report}",
+                    unexpected.len()
+                );
+            }
+        }
+
         per_shard.into_iter().flatten()
+    }
+
+    /// A short `name (TaskId)`-style label for a task, for diagnostics. Falls back to the id alone
+    /// when the task is gone or has no persistent type (e.g. a transient task).
+    #[cfg(debug_assertions)]
+    fn describe_task(&self, task_id: TaskId) -> String {
+        self.access_mut(task_id)
+            .get_persistent_task_type()
+            // `NativeFunction`'s `Debug` is the public view of its name fields.
+            .map(|t| format!("{:?}", t.native_fn))
+            .unwrap_or_else(|| "<unknown>".to_string())
     }
 
     pub fn access_pair_mut(

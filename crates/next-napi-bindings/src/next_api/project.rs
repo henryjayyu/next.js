@@ -1444,28 +1444,37 @@ pub async fn project_write_all_entrypoints_to_disk(
     };
 
     let (mut entrypoints, mut issues) = tt
-        .run(async move {
-            let entrypoints_with_issues_op = get_all_written_entrypoints_with_issues_operation(
-                container,
-                app_dir_only,
-                first_phase,
-            );
+        .run({
+            let tt = tt.clone();
+            async move {
+                // This root operation is held only by this local future, so nothing in the task
+                // graph lists it as a child. Pin it for the duration of the read,
+                // or a concurrent GC pass can collect it out from under us.
+                let entrypoints_with_issues_op = GcRoot::pin(
+                    tt,
+                    get_all_written_entrypoints_with_issues_operation(
+                        container,
+                        app_dir_only,
+                        first_phase,
+                    ),
+                );
 
-            let read =
-                read_strongly_consistent_and_apply_effects(entrypoints_with_issues_op, |v| {
-                    &v.effects
-                })
-                .await?;
-            let AllWrittenEntrypointsWithIssues {
-                entrypoints,
-                issues,
-                ..
-            } = &*read;
+                let read =
+                    read_strongly_consistent_and_apply_effects(*entrypoints_with_issues_op, |v| {
+                        &v.effects
+                    })
+                    .await?;
+                let AllWrittenEntrypointsWithIssues {
+                    entrypoints,
+                    issues,
+                    ..
+                } = &*read;
 
-            Ok((
-                entrypoints.clone(),
-                issues.iter().cloned().collect::<Vec<_>>(),
-            ))
+                Ok((
+                    entrypoints.clone(),
+                    issues.iter().cloned().collect::<Vec<_>>(),
+                ))
+            }
         })
         .or_else(|e| ctx.throw_turbopack_internal_result(&e.into()))
         .await?;
@@ -1508,28 +1517,35 @@ pub async fn project_write_all_entrypoints_to_disk(
         }
 
         let (deferred_entrypoints, deferred_issues) = tt
-            .run(async move {
-                let entrypoints_with_issues_op = get_all_written_entrypoints_with_issues_operation(
-                    container,
-                    app_dir_only,
-                    EntrypointsWritePhase::Deferred,
-                );
+            .run({
+                let tt = tt.clone();
+                async move {
+                    // Pinned for the same reason as the non-deferred phase above.
+                    let entrypoints_with_issues_op = GcRoot::pin(
+                        tt,
+                        get_all_written_entrypoints_with_issues_operation(
+                            container,
+                            app_dir_only,
+                            EntrypointsWritePhase::Deferred,
+                        ),
+                    );
 
-                let read =
-                    read_strongly_consistent_and_apply_effects(entrypoints_with_issues_op, |v| {
-                        &v.effects
-                    })
+                    let read = read_strongly_consistent_and_apply_effects(
+                        *entrypoints_with_issues_op,
+                        |v| &v.effects,
+                    )
                     .await?;
-                let AllWrittenEntrypointsWithIssues {
-                    entrypoints,
-                    issues,
-                    ..
-                } = &*read;
+                    let AllWrittenEntrypointsWithIssues {
+                        entrypoints,
+                        issues,
+                        ..
+                    } = &*read;
 
-                Ok((
-                    entrypoints.clone(),
-                    issues.iter().cloned().collect::<Vec<_>>(),
-                ))
+                    Ok((
+                        entrypoints.clone(),
+                        issues.iter().cloned().collect::<Vec<_>>(),
+                    ))
+                }
             })
             .or_else(|e| ctx.throw_turbopack_internal_result(&e.into()))
             .await?;
@@ -1541,17 +1557,25 @@ pub async fn project_write_all_entrypoints_to_disk(
     }
 
     let emit_issues = tt
-        .run(async move {
-            let emit_result_op = emit_all_output_assets_once_with_issues_operation(
-                container,
-                app_dir_only,
-                has_deferred_entrypoints,
-            );
-            let read =
-                read_strongly_consistent_and_apply_effects(emit_result_op, |v| &v.effects).await?;
-            let OperationResult { issues, .. } = &*read;
+        .run({
+            let tt = tt.clone();
+            async move {
+                // Pinned for the same reason as the entrypoint operations above.
+                let emit_result_op = GcRoot::pin(
+                    tt,
+                    emit_all_output_assets_once_with_issues_operation(
+                        container,
+                        app_dir_only,
+                        has_deferred_entrypoints,
+                    ),
+                );
+                let read =
+                    read_strongly_consistent_and_apply_effects(*emit_result_op, |v| &v.effects)
+                        .await?;
+                let OperationResult { issues, .. } = &*read;
 
-            Ok(issues.clone())
+                Ok(issues.clone())
+            }
         })
         .or_else(|e| ctx.throw_turbopack_internal_result(&e.into()))
         .await?;

@@ -107,7 +107,41 @@ impl CleanupOldEdgesOperation {
         .execute_with_stats(ctx)
     }
 
-    fn execute_with_stats(mut self, ctx: &mut impl ExecuteContext<'_>) -> Stats {
+    /// GC variant: tears down `outdated` and drains only the edge-removal work, returning the
+    /// queue with its rebalance (`balance_edge` / `optimize`) jobs still pending.
+    ///
+    /// GC accumulates this remainder across the whole parallel phase and drains it once collection
+    /// is quiescent: collection only removes nodes, and every removal path is correct on its own,
+    /// but `balance_edge` *adds* edges, which is unsafe while other workers are still deleting
+    /// tasks. See `TurboTasksBackend::gc_collect`.
+    pub fn run_edges_only(
+        task_id: TaskId,
+        outdated: Vec<OutdatedEdge>,
+        queue: AggregationUpdateQueue,
+        ctx: &mut impl ExecuteContext<'_>,
+    ) -> Option<AggregationUpdateQueue> {
+        let op = CleanupOldEdgesOperation::RemoveEdges {
+            task_id,
+            outdated,
+            queue,
+        };
+        let mut deferred = None;
+        op.execute_inner(ctx, &mut Some(&mut deferred));
+        deferred
+    }
+
+    fn execute_with_stats(self, ctx: &mut impl ExecuteContext<'_>) -> Stats {
+        self.execute_inner(ctx, &mut None)
+    }
+
+    /// Shared driver. When `defer_rebalance` is `Some`, the loop stops as soon as only rebalance
+    /// work is left and hands that queue out instead of draining it (the GC path); otherwise it
+    /// runs to completion.
+    fn execute_inner(
+        mut self,
+        ctx: &mut impl ExecuteContext<'_>,
+        defer_rebalance: &mut Option<&mut Option<AggregationUpdateQueue>>,
+    ) -> Stats {
         loop {
             ctx.operation_suspend_point(&self);
             match self {
@@ -320,6 +354,16 @@ impl CleanupOldEdgesOperation {
                     }
                 }
                 CleanupOldEdgesOperation::AggregationUpdate { ref mut queue } => {
+                    if let Some(slot) = defer_rebalance.as_deref_mut()
+                        && queue.only_rebalance_remains()
+                    {
+                        // Edge removal is done; hand the rebalance back to the caller.
+                        let queue = take(queue);
+                        if queue.has_rebalance_work() {
+                            *slot = Some(queue);
+                        }
+                        return Default::default();
+                    }
                     if queue.process(ctx) {
                         self = CleanupOldEdgesOperation::Done {
                             #[cfg(feature = "trace_aggregation_update_stats")]

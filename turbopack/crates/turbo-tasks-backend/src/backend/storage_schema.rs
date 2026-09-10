@@ -878,28 +878,42 @@ impl TaskStorage {
             && self.gc_transient_ref_count() == 0
             && self.get_activeness().is_none()
             && self.get_in_progress().is_none()
-            // It is rare for upper/followers to be present when the ref counts are 0 but it can happen transiently during a concurrent GC pass as uppers are moved around during the cascade.
+            // `upper` is an *incoming* edge: some aggregating node above references this task,
+            // so it must block collection. It is rare for one to be present when the ref counts
+            // are 0, but it can happen transiently during a concurrent GC pass as uppers are
+            // moved around during the cascade.
             && self.upper().is_empty()
-            && self.followers().is_none_or(|f| f.is_empty())
+            // NOTE: `followers` is deliberately *not* checked here. Unlike `upper`, a follower is
+            // an *outgoing* edge — a node this task points at — so it says nothing about whether
+            // anything still references *this* task, exactly like `children`. Treating it as a
+            // pin made every parent-less aggregating node look like a GC root, which is
+            // unreachable garbage by the `children`-reachability model. The follower edges
+            // themselves are torn down by the `InnerOfUpperLostFollowers` cascade that
+            // `CleanupOldEdgesOperation` drives off this task's `children`.
             // `collectibles_dependents` is Meta, so it is always checkable here.
             && self
                 .collectibles_dependents()
                 .is_none_or(|d| d.is_empty())
             // The remaining dependent sets are Data; skipped (leaving this a pre-filter) when Data
             // is not restored.
+            //
+            // `cell_dependents` / `cell_dependents_hashed` are redundant with ancestry (a
+            // cell dependent is always either a child or a sibling under a common ancestor, so it
+            // is collected no later than its target) and counting them blocks collection of the
+            // caller/callee cycle `NftJsonAsset::content` -> `all_assets_from_entries_filtered`.
+            // Removing them exposed a race in the GC cascade (rebalancing running while other
+            // workers were still collecting), which `gc_collect` now avoids by deferring all
+            // rebalance work until the parallel phase is quiescent. `gc_scan_roots` checks the
+            // invariant every pass.
             && (!self.flags.is_restored(TaskDataCategory::Data)
-                || (self.output_dependent().is_empty()
-                    && self.cell_dependents().is_none_or(|d| d.is_empty())
-                    && self
-                        .cell_dependents_hashed()
-                        .is_none_or(|d| d.is_empty())))
+                || self.output_dependent().is_empty())
     }
 
     /// Whether this task is a GC **root**: parent-less, but pinned for some reason
     ///
     /// NOTE: this is a conservative classification.  The typical reason is that there is a
     /// [`TaskStorage::transient_ref`] live, but this will return true if there is merely an
-    /// `upper/follower`.
+    /// `upper`.
     pub fn gc_is_root(&self) -> bool {
         self.flags.is_restored(TaskDataCategory::Meta)
             && !self.flags.deleted()
@@ -907,17 +921,87 @@ impl TaskStorage {
             && !self.gc_maybe_collectible()
     }
 
-    /// Assert that a task classified by [`TaskStorage::gc_is_root`] is held by a pin that eviction
-    /// cannot drop.
-    pub fn gc_debug_assert_root_held_by_transient_pin(&self) {
-        debug_assert!(self.gc_is_root()); // sanity for our caller
-        debug_assert!(
-            self.gc_transient_ref_count() > 0
-                || self.get_in_progress().is_some()
-                || self.get_activeness().is_some(),
-            "GC root is held by a non-transient pin: {self:?}.\nBeing held by another kind of \
-             reference implies a bug in GC or the aggregation graph."
-        );
+    /// Whether this task is held by a pin that eviction cannot drop, which is what a task
+    /// classified by [`TaskStorage::gc_is_root`] is expected to be held by.
+    #[cfg(debug_assertions)]
+    pub fn gc_is_held_by_transient_pin(&self) -> bool {
+        self.gc_transient_ref_count() > 0
+            || self.get_in_progress().is_some()
+            || self.get_activeness().is_some()
+    }
+
+    /// The tasks holding a cell dependency on this one, as `(edge kind, dependent task)` pairs.
+    ///
+    /// Used to check the invariant that makes ignoring cell dependencies safe (see
+    /// [`TaskStorage::gc_maybe_collectible`]): every dependent of a collected task must itself be
+    /// collected in the same pass.
+    #[cfg(debug_assertions)]
+    pub fn gc_cell_dependents(&self) -> GcRootHolders {
+        let mut holders = GcRootHolders::default();
+        if let Some(deps) = self.cell_dependents() {
+            // In a `cell_dependents` entry `CellRef.task` is the DEPENDENT's id, not this task's.
+            for cell_ref in deps.iter() {
+                holders.push("cell_dependent", cell_ref.task);
+            }
+        }
+        if let Some(deps) = self.cell_dependents_hashed() {
+            for (cell_ref, _) in deps.iter() {
+                holders.push("cell_dependent_hashed", cell_ref.task);
+            }
+        }
+        holders
+    }
+
+    /// The concrete references keeping this task un-collectible, as `(edge kind, holder task)`
+    /// pairs.
+    ///
+    /// This is the diagnostic counterpart to [`TaskStorage::gc_maybe_collectible`]: it reports
+    /// *which* incoming edge blocked collection and *who* is on the other end, rather than the
+    /// bare boolean. Each id is the **dependent** — the task referencing this one — so the pairs
+    /// read as "this task is held by <holder> via <kind>".
+    #[cfg(debug_assertions)]
+    pub fn gc_root_holders(&self) -> GcRootHolders {
+        let mut holders = GcRootHolders::default();
+        for (&upper, _) in self.upper().iter() {
+            holders.push("upper", upper);
+        }
+        if let Some(deps) = self.collectibles_dependents() {
+            for &(_, task) in deps.iter() {
+                holders.push("collectibles_dependent", task);
+            }
+        }
+        for &task in self.output_dependent().iter() {
+            holders.push("output_dependent", task);
+        }
+        if let Some(deps) = self.cell_dependents() {
+            // In a `cell_dependents` entry `CellRef.task` is the DEPENDENT's id, not this task's.
+            for cell_ref in deps.iter() {
+                holders.push("cell_dependent", cell_ref.task);
+            }
+        }
+        if let Some(deps) = self.cell_dependents_hashed() {
+            for (cell_ref, _) in deps.iter() {
+                holders.push("cell_dependent_hashed", cell_ref.task);
+            }
+        }
+        holders
+    }
+}
+
+/// `(edge kind, holder task)` pairs explaining why a task is not collectible.
+/// See [`TaskStorage::gc_root_holders`].
+#[cfg(debug_assertions)]
+#[derive(Default, Debug)]
+pub struct GcRootHolders(Vec<(&'static str, TaskId)>);
+
+#[cfg(debug_assertions)]
+impl GcRootHolders {
+    fn push(&mut self, kind: &'static str, task: TaskId) {
+        self.0.push((kind, task));
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &(&'static str, TaskId)> {
+        self.0.iter()
     }
 }
 
