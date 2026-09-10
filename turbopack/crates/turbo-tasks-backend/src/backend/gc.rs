@@ -62,30 +62,6 @@ pub enum TtlCounter {
     FirstStale(u64),
 }
 
-/// Wrapper that gives a `Debug`-less payload a trivial `Debug`, so it can live in a
-/// `#[derive(Debug)]` struct.
-#[derive(Default)]
-pub struct NoDebug<T>(pub T);
-
-impl<T> std::fmt::Debug for NoDebug<T> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("..")
-    }
-}
-
-impl<T> std::ops::Deref for NoDebug<T> {
-    type Target = T;
-    fn deref(&self) -> &T {
-        &self.0
-    }
-}
-
-impl<T> std::ops::DerefMut for NoDebug<T> {
-    fn deref_mut(&mut self) -> &mut T {
-        &mut self.0
-    }
-}
-
 /// One unit of GC work.
 enum GcJob {
     /// Scan one shard of the resident map (by index) and enqueue its candidates as
@@ -131,7 +107,7 @@ impl GcBudget<'_> {
 }
 
 /// Observability counters for one [`TurboTasksBackend::gc_collect`] pass.
-#[derive(Default, Debug)]
+#[derive(Default)]
 pub struct GcStats {
     /// Number of roots detected by the pass
     pub gc_roots: usize,
@@ -149,7 +125,7 @@ pub struct GcStats {
     /// One entry per worker accumulator; they are folded into a single queue (which dedupes the
     /// repeated rebalances of shared edges) at drain time, where an `ExecuteContext` is available.
     /// Not a statistic — this is the pass's deferred work list, like `deleted_roots`.
-    pub deferred_rebalance: NoDebug<Vec<AggregationUpdateQueue>>,
+    pub deferred_rebalance: Vec<AggregationUpdateQueue>,
     /// The gc loop was interrupted by competing work.
     pub interrupted: bool,
 }
@@ -186,8 +162,7 @@ impl GcStats {
         // Merging the queues themselves needs an `ExecuteContext` (a dropped optimize job has to
         // mark its task pending), which `merge` does not have. Concatenate here and fold at drain.
         self.deferred_rebalance
-            .0
-            .append(&mut other.deferred_rebalance.0);
+            .append(&mut other.deferred_rebalance);
         self
     }
 }
@@ -311,11 +286,11 @@ impl TurboTasksBackend {
                     AggregationUpdateQueue::new(),
                     &mut ctx,
                 ) {
-                    match stats.deferred_rebalance.0.first_mut() {
+                    match stats.deferred_rebalance.first_mut() {
                         // Fold into this worker's accumulator, so dedup happens as we go rather
                         // than building one queue per collected task.
                         Some(existing) => existing.merge_rebalance(queue, &mut ctx),
-                        None => stats.deferred_rebalance.0.push(queue),
+                        None => stats.deferred_rebalance.push(queue),
                     }
                 }
                 ControlFlow::Continue(())
@@ -339,7 +314,7 @@ impl TurboTasksBackend {
         // NOTE: this drain is single-threaded and scales with the amount of garbage, so it is a
         // latency risk on a large collection. Left unbounded for now; the existing
         // `optimization_pending` mechanism is how a bound would defer the remainder.
-        let deferred = std::mem::take(&mut stats.deferred_rebalance.0);
+        let deferred = std::mem::take(&mut stats.deferred_rebalance);
         if !deferred.is_empty() {
             let noop_collector = |_task_id| {};
             let mut ctx = ExecuteContextImpl::new_for_gc(self, turbo_tasks, phase, &noop_collector);
