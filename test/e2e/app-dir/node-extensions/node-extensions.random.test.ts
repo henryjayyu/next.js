@@ -2,9 +2,6 @@ import { nextTestSetup } from 'e2e-utils'
 
 describe('Node Extensions', () => {
   describe('Random', () => {
-    // TODO(deploy-test-completion): Re-enable this suite in deploy mode.
-    // No deploy-specific incompatibility is documented.
-    // @force-gate !deploy
     describe('Cache Components', () => {
       const { next } = nextTestSetup({
         files: __dirname + '/fixtures/random/cache-components',

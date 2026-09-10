@@ -151,8 +151,6 @@ describe('Middleware custom matchers', () => {
       expect(noReload).toBe(true)
     })
 
-    // TODO(deploy-test-completion): The reason for this deploy failure is not documented.
-    // @force-gate !deploy
     it('should match has cookie on client routing', async () => {
       const browser = await next.browser('/routes')
       await browser.addCookie({ name: 'loggedIn', value: 'true' })
