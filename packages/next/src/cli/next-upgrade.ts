@@ -42,9 +42,16 @@ export async function spawnNextUpgrade(
         return
       }
 
-      console.log(
-        `[next upgrade: ready] Security upgrade target: ${result.app.nextVersion} → ${result.target.nextVersion}.`
-      )
+      // Only ready upgrades reach the agent. Retain the resolved inputs and
+      // guides first; the agent owns repository preflight, edits and verification.
+      const { prepareUpgradeResources } =
+        require('../lib/upgrade/resources') as typeof import('../lib/upgrade/resources')
+      const { handoffUpgrade } =
+        require('../lib/upgrade/harness') as typeof import('../lib/upgrade/harness')
+      const packet = await prepareUpgradeResources(result, {
+        dryRun: options.experimentalAgentDryRun,
+      })
+      await handoffUpgrade(packet.prompt)
     } catch (error) {
       console.error(
         '[next upgrade: blocked]',
