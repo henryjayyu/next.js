@@ -605,12 +605,12 @@ pub fn project_new<'env>(
                     let container_op = ProjectContainer::new_operation(rcstr!("next.js"), is_dev);
                     ProjectContainer::initialize(container_op, options).await?;
                     let container = container_op.resolve().strongly_consistent().await?;
-                    // Return the operation itself so we can pin it below
+                    // Return the operation itself so we can take ownership of its pin below
                     Ok((container, container_op))
                 })
                 .or_else(|e| turbopack_ctx.throw_turbopack_internal_result(&e.into()))
                 .await?;
-            let container_gc_root = GcRoot::pin(turbo_tasks.clone(), container_op);
+            let container_gc_root = GcRoot::from_pinned(turbo_tasks.clone(), container_op);
 
             if is_dev {
                 Handle::current().spawn({
@@ -1445,22 +1445,17 @@ pub async fn project_write_all_entrypoints_to_disk(
 
     let (mut entrypoints, mut issues) = tt
         .run({
-            let tt = tt.clone();
             async move {
-                // This root operation is held only by this local future, so nothing in the task
-                // graph lists it as a child. Pin it for the duration of the read,
-                // or a concurrent GC pass can collect it out from under us.
-                let entrypoints_with_issues_op = GcRoot::pin(
-                    tt,
-                    get_all_written_entrypoints_with_issues_operation(
-                        container,
-                        app_dir_only,
-                        first_phase,
-                    ),
+                // Parentless, so `initialize_new_task` already pinned it for the session; no
+                // explicit `GcRoot` needed here.
+                let entrypoints_with_issues_op = get_all_written_entrypoints_with_issues_operation(
+                    container,
+                    app_dir_only,
+                    first_phase,
                 );
 
                 let read =
-                    read_strongly_consistent_and_apply_effects(*entrypoints_with_issues_op, |v| {
+                    read_strongly_consistent_and_apply_effects(entrypoints_with_issues_op, |v| {
                         &v.effects
                     })
                     .await?;
@@ -1518,20 +1513,16 @@ pub async fn project_write_all_entrypoints_to_disk(
 
         let (deferred_entrypoints, deferred_issues) = tt
             .run({
-                let tt = tt.clone();
                 async move {
-                    // Pinned for the same reason as the non-deferred phase above.
-                    let entrypoints_with_issues_op = GcRoot::pin(
-                        tt,
+                    let entrypoints_with_issues_op =
                         get_all_written_entrypoints_with_issues_operation(
                             container,
                             app_dir_only,
                             EntrypointsWritePhase::Deferred,
-                        ),
-                    );
+                        );
 
                     let read = read_strongly_consistent_and_apply_effects(
-                        *entrypoints_with_issues_op,
+                        entrypoints_with_issues_op,
                         |v| &v.effects,
                     )
                     .await?;
@@ -1558,19 +1549,14 @@ pub async fn project_write_all_entrypoints_to_disk(
 
     let emit_issues = tt
         .run({
-            let tt = tt.clone();
             async move {
-                // Pinned for the same reason as the entrypoint operations above.
-                let emit_result_op = GcRoot::pin(
-                    tt,
-                    emit_all_output_assets_once_with_issues_operation(
-                        container,
-                        app_dir_only,
-                        has_deferred_entrypoints,
-                    ),
+                let emit_result_op = emit_all_output_assets_once_with_issues_operation(
+                    container,
+                    app_dir_only,
+                    has_deferred_entrypoints,
                 );
                 let read =
-                    read_strongly_consistent_and_apply_effects(*emit_result_op, |v| &v.effects)
+                    read_strongly_consistent_and_apply_effects(emit_result_op, |v| &v.effects)
                         .await?;
                 let OperationResult { issues, .. } = &*read;
 

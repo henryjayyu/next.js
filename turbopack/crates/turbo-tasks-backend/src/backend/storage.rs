@@ -288,10 +288,26 @@ impl Storage {
     /// Mark a newly allocated task as restored (skip DB queries) and new (include in persistence
     /// snapshots). Optionally sets the `persistent_task_type` eagerly so it's available for
     /// persistence snapshots without needing to propagate it through `connect_child`.
-    pub fn initialize_new_task(&self, task_id: TaskId, task_type: Option<CachedTaskTypeArc>) {
+    ///
+    /// `parentless` pins the task against GC. A task created with no parent is an entry point:
+    /// nothing in the graph will ever list it as a child, so no `parent_count` can protect it and
+    /// nothing can later make it reachable. (That is the same condition `ConnectChildOperation`
+    /// uses to force a root aggregation number.) Without the pin a GC pass collects it while its
+    /// caller is still reading the result. The pin is applied here, under the guard this function
+    /// already holds, rather than by the caller taking the task lock a second time.
+    pub fn initialize_new_task(
+        &self,
+        task_id: TaskId,
+        task_type: Option<CachedTaskTypeArc>,
+        parentless: bool,
+    ) {
         let mut task = self.access_mut(task_id);
         task.flags.set_restored(TaskDataCategory::All);
         task.flags.set_new_task(true);
+        if parentless {
+            // A brand new task starts at zero, so this is the first reference.
+            task.gc_init_parentless_ref();
+        }
         if let Some(task_type) = task_type {
             task.set_persistent_task_type(task_type);
             if !task_id.is_transient() {

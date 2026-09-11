@@ -742,6 +742,15 @@ pub trait Backend: Sized + Sync + Send {
     /// Removes a pin added by [`pin_task_for_gc`](Backend::pin_task_for_gc).
     fn unpin_task_for_gc(&self, _task: TaskId, _turbo_tasks: &TurboTasks<Self>);
 
+    /// Converts the unowned entry-point reference on `task` (added at creation for a task with
+    /// no parent) into an ordinary owned one, so the adopting handle's release balances it.
+    ///
+    /// Returns false when there is no such reference — the task had a parent, or the reference
+    /// was already adopted. Backends without GC report true, since they never added one.
+    fn adopt_entry_ref_for_gc(&self, _task: TaskId, _turbo_tasks: &TurboTasks<Self>) -> bool {
+        true
+    }
+
     fn create_transient_task(
         &self,
         task_type: TransientTaskType,

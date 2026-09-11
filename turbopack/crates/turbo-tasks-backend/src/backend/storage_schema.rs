@@ -31,6 +31,16 @@ use turbo_tasks::{
     task_storage,
 };
 
+/// The top bit of `transient_ref_count`, marking the *unowned* reference that
+/// [`TaskStorage::gc_init_parentless_ref`] gives a task created without a parent.
+///
+/// A parentless task is an entry point, so nothing in the graph protects it and it is pinned at
+/// creation. But that pin has no owner: no handle exists to release it, and the task stays
+/// resident for the session. Recording it as a distinct bit rather than a plain `+1` keeps
+/// "pinned because nobody owns it" separate from "pinned because N handles do", so adopting it
+/// twice is caught at once instead of quietly leaving the count one too high.
+const GC_UNOWNED_ENTRY_REF: u32 = 1 << 31;
+
 use crate::{
     backend::{cell_data::CellData, counter_map::CounterMap},
     data::{
@@ -856,6 +866,46 @@ impl TaskStorage {
     /// `transient_ref_count` field for what counts as one.
     pub fn gc_transient_ref_count(&self) -> u32 {
         self.get_transient_ref_count().copied().unwrap_or(0)
+    }
+
+    /// Records the entry-point reference on a task that is being created without a parent.
+    ///
+    /// Stored as [`GC_UNOWNED_ENTRY_REF`] rather than a plain `+1` so that the reference stays
+    /// distinguishable from ordinary ones. Nothing owns it — no handle will ever release it — and
+    /// [`Self::gc_adopt_entry_ref`] is what converts it into an owned `+1`. Keeping the two
+    /// states apart makes a second adoption of the same task an immediate, cheap error instead of
+    /// an off-by-one in a count that happens to look plausible.
+    ///
+    /// Only valid during initialization, where the count is known to still be zero — see
+    /// [`Storage::initialize_new_task`](crate::backend::storage::Storage::initialize_new_task).
+    pub fn gc_init_parentless_ref(&mut self) {
+        debug_assert_eq!(
+            self.gc_transient_ref_count(),
+            0,
+            "a newly created task must not already have transient references"
+        );
+        self.set_transient_ref_count(GC_UNOWNED_ENTRY_REF);
+    }
+
+    /// Whether this task still holds the unowned entry-point reference from creation.
+    pub fn gc_has_unowned_entry_ref(&self) -> bool {
+        self.gc_transient_ref_count() & GC_UNOWNED_ENTRY_REF != 0
+    }
+
+    /// Converts the unowned entry-point reference into an ordinary owned one, for a handle that
+    /// is taking responsibility for releasing it (see `GcRoot::from_pinned`).
+    ///
+    /// Returns false when there is no such reference to adopt — the task was created with a
+    /// parent, or something already adopted it.
+    pub fn gc_adopt_entry_ref(&mut self) -> bool {
+        let current = self.gc_transient_ref_count();
+        if current & GC_UNOWNED_ENTRY_REF == 0 {
+            return false;
+        }
+        // Clear the marker and leave a normal +1 in its place, so the adopting handle's release
+        // goes through the same path as any other reference.
+        self.set_transient_ref_count(current - GC_UNOWNED_ENTRY_REF + 1);
+        true
     }
 
     /// Whether a GC pass may collect this task: nothing references it, via parents, transient
