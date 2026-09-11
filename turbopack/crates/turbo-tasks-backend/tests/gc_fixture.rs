@@ -1,4 +1,8 @@
 //! Shared graph shapes for the GC tests.
+//!
+//! This module is compiled into each test binary separately, so any helper a given binary doesn't
+//! call reads as dead code there.
+#![allow(dead_code)]
 
 use anyhow::Result;
 use turbo_tasks::{ResolvedVc, State, Vc};

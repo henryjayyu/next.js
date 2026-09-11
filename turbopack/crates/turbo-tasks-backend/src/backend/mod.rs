@@ -1843,11 +1843,8 @@ impl TurboTasksBackend {
                         // Initialize storage BEFORE making task_id visible in the cache.
                         // This ensures any thread that reads task_id from the cache sees
                         // the storage entry already initialized (restored flags set).
-                        self.storage.initialize_new_task(
-                            task_id,
-                            Some(task_type.clone()),
-                            parent_task.is_none(),
-                        );
+                        self.storage
+                            .initialize_new_task(task_id, Some(task_type.clone()));
                         entry.insert((task_type, task_id));
                         (task_id, true)
                     }
@@ -4005,10 +4002,6 @@ impl Backend for TurboTasksBackend {
 
     fn unpin_task_for_gc(&self, task: TaskId, turbo_tasks: &TurboTasks<Self>) {
         self.unpin_task_for_gc(task, turbo_tasks);
-    }
-
-    fn adopt_entry_ref_for_gc(&self, task: TaskId, _turbo_tasks: &TurboTasks<Self>) -> bool {
-        self.storage.access_mut(task).gc_adopt_entry_ref()
     }
 
     fn connect_task(

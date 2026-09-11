@@ -207,10 +207,6 @@ pub trait TurboTasksApi: TurboTasksCallApi + Sync + Send {
     /// Removes a pin added by [`pin_task_for_gc`](TurboTasksApi::pin_task_for_gc).
     fn unpin_task_for_gc(&self, task: TaskId);
 
-    /// Adopts the unowned entry-point reference on `task`; see
-    /// [`Backend::adopt_entry_ref_for_gc`](crate::backend::Backend::adopt_entry_ref_for_gc).
-    fn adopt_entry_ref_for_gc(&self, task: TaskId) -> bool;
-
     fn connect_task(&self, task: TaskId);
 
     /// Wraps the given future in the current task.
@@ -1930,10 +1926,6 @@ impl<B: Backend + 'static> TurboTasksApi for TurboTasks<B> {
         self.backend.unpin_task_for_gc(task, self);
     }
 
-    fn adopt_entry_ref_for_gc(&self, task: TaskId) -> bool {
-        self.backend.adopt_entry_ref_for_gc(task, self)
-    }
-
     /// Creates a future that inherits the current task id and task state. The current global task
     /// will wait for this future to be dropped before exiting.
     fn spawn_detached_for_testing(&self, fut: Pin<Box<dyn Future<Output = ()> + Send + 'static>>) {
@@ -2288,44 +2280,6 @@ impl<T: ?Sized> GcRoot<T> {
     /// to it.
     pub fn pin(tt: Arc<dyn TurboTasksApi>, vc: OperationVc<T>) -> Self {
         tt.pin_task_for_gc(vc.task_id());
-        Self { tt, vc }
-    }
-
-    /// Takes ownership of the pin an operation *already* has, instead of adding another.
-    ///
-    /// An operation created outside a task has no parent, so `initialize_new_task` pins it for
-    /// the session. That pin has no owner: nothing will ever release it, and the task stays
-    /// resident until the session ends. Where the caller does have a real lifecycle for the
-    /// operation — a handle passed to JS, a container that is eventually torn down — this adopts
-    /// that existing pin so dropping the guard actually releases it.
-    ///
-    /// Use [`GcRoot::pin`] instead for an operation created *inside* a task: that one has a
-    /// parent and no automatic pin, so it needs a new one rather than an adoption.
-    ///
-    /// Cloning the returned guard still adds a pin of its own, so each clone releases its own
-    /// reference and the last drop releases the original.
-    #[track_caller]
-    pub fn from_pinned(tt: Arc<dyn TurboTasksApi>, vc: OperationVc<T>) -> Self {
-        // Adoption is only valid for an operation that `initialize_new_task` pinned, which
-        // happens exactly when it was created with no parent. Inside a task -- including the
-        // `Once` task that `run_once` establishes -- an operation has a parent and no such pin,
-        // so adopting one would silently take a reference that was never added.
-        debug_assert!(
-            CURRENT_TASK_STATE
-                .try_with(|ts| ts.current_task_id().is_none())
-                .unwrap_or(true),
-            "GcRoot::from_pinned inside a task: this operation has a parent, so it was never \
-             given the session pin that this would adopt. Use `GcRoot::pin` instead."
-        );
-        // Take over the unowned reference rather than adding a second one. This fails loudly on
-        // a task that never had one (created with a parent) or whose reference another handle
-        // already adopted -- both of which would otherwise leave a silently wrong count.
-        let adopted = tt.adopt_entry_ref_for_gc(vc.task_id());
-        debug_assert!(
-            adopted,
-            "GcRoot::from_pinned: no unowned entry reference to adopt. The operation was either \
-             created inside a task (use `GcRoot::pin`) or already adopted elsewhere."
-        );
         Self { tt, vc }
     }
 }

@@ -605,12 +605,15 @@ pub fn project_new<'env>(
                     let container_op = ProjectContainer::new_operation(rcstr!("next.js"), is_dev);
                     ProjectContainer::initialize(container_op, options).await?;
                     let container = container_op.resolve().strongly_consistent().await?;
-                    // Return the operation itself so we can take ownership of its pin below
+                    // Return the operation itself so we can pin it below
                     Ok((container, container_op))
                 })
                 .or_else(|e| turbopack_ctx.throw_turbopack_internal_result(&e.into()))
                 .await?;
-            let container_gc_root = GcRoot::from_pinned(turbo_tasks.clone(), container_op);
+            // Adds a pin rather than adopting the one a parentless task gets at creation: on a
+            // warm persistent cache this container is *restored* from backing storage rather than
+            // created, and the restore path never adds that reference.
+            let container_gc_root = GcRoot::pin(turbo_tasks.clone(), container_op);
 
             if is_dev {
                 Handle::current().spawn({
