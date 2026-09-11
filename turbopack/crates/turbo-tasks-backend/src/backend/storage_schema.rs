@@ -1214,6 +1214,53 @@ mod tests {
     use super::*;
     use crate::data::{AggregationNumber, CellRef, Dirtyness, OutputValue};
 
+    /// The entry reference added at creation is adoptable exactly once, and adopting it leaves an
+    /// ordinary owned reference behind so the adopting handle's release balances it.
+    #[test]
+    fn entry_ref_is_adoptable_once() {
+        let mut storage = TaskStorage::new();
+        assert!(!storage.gc_has_unowned_entry_ref());
+        assert_eq!(storage.gc_transient_ref_count(), 0);
+
+        storage.gc_init_parentless_ref();
+        assert!(storage.gc_has_unowned_entry_ref());
+        // Marked, and therefore pinned: a task holding only the marker is not collectible.
+        assert_ne!(storage.gc_transient_ref_count(), 0);
+
+        assert!(storage.gc_adopt_entry_ref());
+        // The marker is gone and a plain +1 stands in its place.
+        assert!(!storage.gc_has_unowned_entry_ref());
+        assert_eq!(storage.gc_transient_ref_count(), 1);
+
+        // A second adoption has nothing to take, and must not touch the count.
+        assert!(!storage.gc_adopt_entry_ref());
+        assert_eq!(storage.gc_transient_ref_count(), 1);
+    }
+
+    /// Adopting on a task that never had an entry reference (it was created with a parent) fails
+    /// rather than inventing one.
+    #[test]
+    fn adopt_without_entry_ref_fails() {
+        let mut storage = TaskStorage::new();
+        assert!(!storage.gc_adopt_entry_ref());
+        assert_eq!(storage.gc_transient_ref_count(), 0);
+    }
+
+    /// The marker coexists with ordinary references: adopting it preserves the others.
+    #[test]
+    fn adopt_preserves_other_refs() {
+        let mut storage = TaskStorage::new();
+        storage.gc_init_parentless_ref();
+        // Two unrelated handles pin the same task.
+        let with_marker = storage.gc_transient_ref_count();
+        storage.set_transient_ref_count(with_marker + 2);
+
+        assert!(storage.gc_adopt_entry_ref());
+        // 2 existing + 1 adopted.
+        assert_eq!(storage.gc_transient_ref_count(), 3);
+        assert!(!storage.gc_has_unowned_entry_ref());
+    }
+
     #[test]
     fn test_accessors() {
         let mut storage = TaskStorage::new();
